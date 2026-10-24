@@ -605,3 +605,143 @@ def test_proxy_stats_failure_keeps_url_credentials_out_of_logs(level) -> None:
     if level == logging.DEBUG:
         # The failure is still diagnosable: the redacted URL and the exception type.
         assert any(f"127.0.0.1:{port}" in line and "JSONDecodeError" in line for line in formatted)
+
+
+# --- Kompress background warm-up --------------------------------------------
+
+
+def _patch_kompress(monkeypatch, preload):
+    from headroom.transforms import kompress_compressor as kc
+
+    done = threading.Event()
+
+    def _preload(self, *, allow_download=True):
+        try:
+            return preload(allow_download)
+        finally:
+            done.set()
+
+    monkeypatch.setattr(kc.KompressCompressor, "preload", _preload)
+    monkeypatch.setattr(kc, "is_kompress_available", lambda: True)
+    return done
+
+
+def test_mcp_warmup_preloads_from_local_cache_first(monkeypatch) -> None:
+    monkeypatch.setenv("HEADROOM_KOMPRESS_WARMUP", "1")
+    calls: list[bool] = []
+    done = _patch_kompress(monkeypatch, lambda allow: calls.append(allow) or "onnx")
+    server = mcp_server.HeadroomMCPServer(check_proxy=False)
+    assert server._start_kompress_background_warmup() is True
+    assert done.wait(5)
+    assert calls == [False]
+
+
+def test_mcp_warmup_falls_back_to_download_when_not_cached(monkeypatch) -> None:
+    from headroom.transforms.kompress_compressor import KompressModelNotCached
+
+    monkeypatch.setenv("HEADROOM_KOMPRESS_WARMUP", "1")
+    calls: list[bool] = []
+
+    def preload(allow):
+        calls.append(allow)
+        if not allow:
+            raise KompressModelNotCached("nope")
+        return "onnx"
+
+    _patch_kompress(monkeypatch, preload)
+    server = mcp_server.HeadroomMCPServer(check_proxy=False)
+    assert server._start_kompress_background_warmup() is True
+    deadline = threading.Event()
+    for _ in range(100):
+        if calls == [False, True]:
+            break
+        deadline.wait(0.05)
+    assert calls == [False, True]
+
+
+def test_mcp_warmup_disabled_by_env(monkeypatch) -> None:
+    monkeypatch.setenv("HEADROOM_KOMPRESS_WARMUP", "0")
+    calls: list[bool] = []
+    _patch_kompress(monkeypatch, lambda allow: calls.append(allow))
+    server = mcp_server.HeadroomMCPServer(check_proxy=False)
+    assert server._start_kompress_background_warmup() is False
+    assert calls == []
+
+
+def test_mcp_warmup_swallows_preload_errors(monkeypatch) -> None:
+    monkeypatch.setenv("HEADROOM_KOMPRESS_WARMUP", "1")
+
+    def boom(allow):
+        raise RuntimeError("boom")
+
+    done = _patch_kompress(monkeypatch, boom)
+    server = mcp_server.HeadroomMCPServer(check_proxy=False)
+    assert server._start_kompress_background_warmup() is True
+    assert done.wait(5)
+
+
+def test_run_stdio_starts_kompress_warmup(monkeypatch) -> None:
+    server = mcp_server.HeadroomMCPServer(check_proxy=False)
+
+    @contextlib.asynccontextmanager
+    async def fake_stdio_server():
+        yield (object(), object())
+
+    monkeypatch.setattr(mcp_server, "stdio_server", fake_stdio_server)
+
+    async def returns(*_args, **_kwargs) -> None:
+        return None
+
+    monkeypatch.setattr(server.server, "run", returns, raising=False)
+    calls: list[int] = []
+    monkeypatch.setattr(server, "_start_kompress_background_warmup", lambda: calls.append(1))
+
+    asyncio.run(server.run_stdio(parent_death_poll_interval=0.001))
+    assert calls == [1]
+
+
+def test_run_streamable_http_starts_kompress_warmup(monkeypatch) -> None:
+    import sys
+    import types
+
+    server = mcp_server.HeadroomMCPServer(check_proxy=False)
+    served: list[bool] = []
+
+    async def fake_serve(*_args, **_kwargs) -> None:
+        served.append(True)
+
+    fake_http = types.ModuleType("headroom.ccr.mcp_http")
+    fake_http.serve_streamable_http = fake_serve  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "headroom.ccr.mcp_http", fake_http)
+    calls: list[int] = []
+    monkeypatch.setattr(server, "_start_kompress_background_warmup", lambda: calls.append(1))
+
+    asyncio.run(server.run_streamable_http("127.0.0.1", 0, "/mcp"))
+    assert calls == [1]
+    assert served == [True]
+
+
+def test_mcp_warmup_makes_kompress_ready(monkeypatch) -> None:
+    from headroom.transforms import kompress_compressor as kc
+
+    monkeypatch.setenv("HEADROOM_KOMPRESS_WARMUP", "1")
+    monkeypatch.setattr(kc, "_kompress_cache", {})
+    monkeypatch.setattr(kc, "is_kompress_available", lambda: True)
+    monkeypatch.setattr(kc, "_canary_threshold_seconds", lambda: None)
+    done = threading.Event()
+
+    def fake_load(model_id=kc.HF_MODEL_ID, device="auto", *, allow_download=True):
+        kc._kompress_cache[model_id] = (object(), object(), "onnx")
+        done.set()
+        return kc._kompress_cache[model_id]
+
+    monkeypatch.setattr(kc, "_load_kompress", fake_load)
+    assert kc.KompressCompressor().is_ready() is False
+    server = mcp_server.HeadroomMCPServer(check_proxy=False)
+    assert server._start_kompress_background_warmup() is True
+    assert done.wait(5)
+    for _ in range(100):
+        if kc.KompressCompressor().is_ready():
+            break
+        threading.Event().wait(0.05)
+    assert kc.KompressCompressor().is_ready() is True

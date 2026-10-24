@@ -1150,6 +1150,51 @@ class HeadroomMCPServer:
             os.getppid(),
         )
 
+    def _start_kompress_background_warmup(self) -> bool:
+        """Warm the Kompress model on a daemon thread (parity with the proxy).
+
+        Without this the ContentRouter never becomes ready in a long-lived MCP
+        process and ``headroom_compress`` stays ``router:noop``. Tries the local
+        cache first (no network), then falls back to a download. Never blocks
+        the handshake and never writes to stdout. Disabled with
+        ``HEADROOM_KOMPRESS_WARMUP=0``. Returns ``True`` if a thread started.
+        """
+        raw = os.environ.get("HEADROOM_KOMPRESS_WARMUP", "").strip().lower()
+        if raw in ("0", "false", "no", "off"):
+            return False
+        if not raw and os.environ.get("PYTEST_CURRENT_TEST"):
+            return False
+
+        def _warm() -> None:
+            started = time.monotonic()
+            try:
+                from headroom.transforms.kompress_compressor import (
+                    KompressCompressor,
+                    KompressModelNotCached,
+                    is_kompress_available,
+                )
+
+                if not is_kompress_available():
+                    return
+                compressor = KompressCompressor()
+                try:
+                    backend = compressor.preload(allow_download=False)
+                except KompressModelNotCached:
+                    backend = compressor.preload(allow_download=True)
+            except Exception as exc:  # lazy path still loads on first use
+                logger.warning("Kompress background warm-up failed: %s", describe_exception(exc))
+                return
+            logger.info(
+                "Kompress: warmed in the background in %.0f ms (backend %s)",
+                (time.monotonic() - started) * 1000,
+                backend,
+            )
+
+        import threading
+
+        threading.Thread(target=_warm, name="mcp-kompress-warmup", daemon=True).start()
+        return True
+
     async def run_stdio(
         self,
         parent_death_poll_interval: float = PARENT_DEATH_POLL_INTERVAL,
@@ -1163,6 +1208,7 @@ class HeadroomMCPServer:
         """
         async with stdio_server() as (read_stream, write_stream):
             logger.info("Headroom MCP Server starting (proxy: %s)", redact_url(self.proxy_url))
+            self._start_kompress_background_warmup()
             serve_task = asyncio.create_task(
                 self.server.run(
                     read_stream,
@@ -1205,6 +1251,7 @@ class HeadroomMCPServer:
         """Run the server with Streamable HTTP transport."""
         from .mcp_http import serve_streamable_http
 
+        self._start_kompress_background_warmup()
         await serve_streamable_http(
             self,
             host=host,
