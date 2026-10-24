@@ -28,6 +28,7 @@ import contextlib
 import json
 import logging
 import os
+import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -1150,50 +1151,35 @@ class HeadroomMCPServer:
             os.getppid(),
         )
 
-    def _start_kompress_background_warmup(self) -> bool:
-        """Warm the Kompress model on a daemon thread (parity with the proxy).
+    def _start_kompress_warmup(self) -> bool:
+        """Warm the Kompress model that ``headroom.compress.compress()`` will use.
 
-        Without this the ContentRouter never becomes ready in a long-lived MCP
-        process and ``headroom_compress`` stays ``router:noop``. Tries the local
-        cache first (no network), then falls back to a download. Never blocks
-        the handshake and never writes to stdout. Disabled with
-        ``HEADROOM_KOMPRESS_WARMUP=0``. Returns ``True`` if a thread started.
+        Without this the router never finds the model ready (its own background
+        load needs the network), so ``headroom_compress`` stays ``router:noop``.
+        Cache-first; the model load runs on a daemon thread and the servers call this
+        via :meth:`_launch_kompress_warmup` so pipeline construction is off the
+        event loop too. Never writes to stdout.
         """
-        raw = os.environ.get("HEADROOM_KOMPRESS_WARMUP", "").strip().lower()
-        if raw in ("0", "false", "no", "off"):
+        try:
+            from headroom.compress import _get_pipeline
+            from headroom.transforms.kompress_compressor import start_kompress_background_warmup
+
+            return start_kompress_background_warmup((_get_pipeline(),), cache_first=True)
+        except Exception as exc:
+            logger.warning("Kompress warm-up not started: %s", describe_exception(exc))
             return False
-        if not raw and os.environ.get("PYTEST_CURRENT_TEST"):
-            return False
 
-        def _warm() -> None:
-            started = time.monotonic()
-            try:
-                from headroom.transforms.kompress_compressor import (
-                    KompressCompressor,
-                    KompressModelNotCached,
-                    is_kompress_available,
-                )
+    def _launch_kompress_warmup(self) -> threading.Thread:
+        """Run :meth:`_start_kompress_warmup` off the calling thread.
 
-                if not is_kompress_available():
-                    return
-                compressor = KompressCompressor()
-                try:
-                    backend = compressor.preload(allow_download=False)
-                except KompressModelNotCached:
-                    backend = compressor.preload(allow_download=True)
-            except Exception as exc:  # lazy path still loads on first use
-                logger.warning("Kompress background warm-up failed: %s", describe_exception(exc))
-                return
-            logger.info(
-                "Kompress: warmed in the background in %.0f ms (backend %s)",
-                (time.monotonic() - started) * 1000,
-                backend,
-            )
-
-        import threading
-
-        threading.Thread(target=_warm, name="mcp-kompress-warmup", daemon=True).start()
-        return True
+        Building the compression pipeline imports every transform, which would
+        delay the MCP handshake if done on the event loop.
+        """
+        thread = threading.Thread(
+            target=self._start_kompress_warmup, name="kompress-warmup-init", daemon=True
+        )
+        thread.start()
+        return thread
 
     async def run_stdio(
         self,
@@ -1208,7 +1194,7 @@ class HeadroomMCPServer:
         """
         async with stdio_server() as (read_stream, write_stream):
             logger.info("Headroom MCP Server starting (proxy: %s)", redact_url(self.proxy_url))
-            self._start_kompress_background_warmup()
+            self._launch_kompress_warmup()
             serve_task = asyncio.create_task(
                 self.server.run(
                     read_stream,
@@ -1251,7 +1237,7 @@ class HeadroomMCPServer:
         """Run the server with Streamable HTTP transport."""
         from .mcp_http import serve_streamable_http
 
-        self._start_kompress_background_warmup()
+        self._launch_kompress_warmup()
         await serve_streamable_http(
             self,
             host=host,
